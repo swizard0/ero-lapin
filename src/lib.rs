@@ -212,7 +212,12 @@ fn release(
 )
     -> impl Future<Item = AmqpConnected, Error = ErrorSeverity<InitState, ()>>
 {
-    result(Ok(connected))
+    lazy(move || if connected.heartbeat_gone.load(Ordering::SeqCst) {
+        error!("heartbeat task is gone, restarting connection");
+        Err(ErrorSeverity::Recoverable { state: connected.init_state, })
+    } else {
+        Ok(connected)
+    })
 }
 
 fn close(
