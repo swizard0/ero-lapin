@@ -105,11 +105,11 @@ struct AmqpConnected {
 fn init(
     init_state: InitState,
 )
-    -> impl Future<Item = AmqpConnected, Error = ErrorSeverity<InitState, ()>>
+    -> Box<dyn Future<Item = AmqpConnected, Error = ErrorSeverity<InitState, ()>> + Send + 'static>
 {
     let InitState { amqp_params, tcp_lode, executor, } = init_state;
 
-    tcp_lode
+    let future = tcp_lode
         .steal_resource()
         .map_err(|()| {
             debug!("tcp_stream lode is gone, terminating");
@@ -155,21 +155,23 @@ fn init(
                         },
                     }
                 })
-        })
+        });
+    Box::new(future)
 }
 
 fn aquire(
     connected: AmqpConnected,
 )
-    -> impl Future<Item = (Channel<TcpStream>, AmqpConnected), Error = ErrorSeverity<InitState, ()>>
+    -> Box<dyn Future<Item = (Channel<TcpStream>, AmqpConnected), Error = ErrorSeverity<InitState, ()>> + Send + 'static>
 {
     let AmqpConnected { init_state, client, heartbeat_gone, } = connected;
-    lazy(move || if heartbeat_gone.load(Ordering::SeqCst) {
-        error!("heartbeat task is gone, restarting connection");
-        Err(ErrorSeverity::Recoverable { state: init_state, })
-    } else {
-        Ok((init_state, heartbeat_gone))
-    })
+    let future = lazy(
+        move || if heartbeat_gone.load(Ordering::SeqCst) {
+            error!("heartbeat task is gone, restarting connection");
+            Err(ErrorSeverity::Recoverable { state: init_state, })
+        } else {
+            Ok((init_state, heartbeat_gone))
+        })
         .and_then(move |(init_state, heartbeat_gone)| {
             client.create_channel()
                 .then(move |create_result| {
@@ -203,7 +205,8 @@ fn aquire(
                         },
                     }
                 })
-        })
+        });
+    Box::new(future)
 }
 
 fn release(
