@@ -60,7 +60,7 @@ impl Default for AmqpParams {
 
 pub struct Params<N> {
     pub amqp_params: AmqpParams,
-    pub lode_params: lode::Params<N>,
+    pub lode_params: ero::Params<N>,
 }
 
 pub fn spawn<N>(
