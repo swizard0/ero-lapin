@@ -34,11 +34,8 @@ use log::{
 
 use ero::{
     ErrorSeverity,
-    lode::{
-        self,
-        Lode,
-        LodeResource,
-    },
+    lode::{self, LodeResource},
+    supervisor::Supervisor,
 };
 
 #[derive(Debug)]
@@ -63,12 +60,12 @@ pub struct Params<N> {
     pub lode_params: ero::Params<N>,
 }
 
-pub fn spawn<N>(
-    executor: &tokio::runtime::TaskExecutor,
+pub fn spawn_link<N>(
+    supervisor: &Supervisor,
     params: Params<N>,
     tcp_lode: LodeResource<TcpStream>,
 )
-    -> Lode<Channel<TcpStream>>
+    -> LodeResource<Channel<TcpStream>>
 where N: AsRef<str> + Send + 'static,
 {
     let Params { amqp_params, lode_params, } = params;
@@ -76,11 +73,11 @@ where N: AsRef<str> + Send + 'static,
     let init_state = InitState {
         amqp_params,
         tcp_lode,
-        executor: executor.clone(),
+        executor: supervisor.executor().clone(),
     };
 
-    lode::shared::spawn(
-        executor,
+    lode::shared::spawn_link(
+        supervisor,
         lode_params,
         init_state,
         init,
