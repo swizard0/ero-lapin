@@ -1,15 +1,15 @@
 [package]
 name = "ero-lapin"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 edition = "2018"
 
 [dependencies]
 ero = { git = "https://github.com/swizard0/ero.git" }
-log = "0.4"
-tokio = "0.1"
-futures = "0.1"
-lapin-futures = "0.14"
+log = "^0.4"
+tokio = "^0.1"
+futures = "^0.1"
+lapin-futures = "^0.18"
 
 [dev-dependencies]
-pretty_env_logger = "0.2"
+pretty_env_logger = "^0.3"
