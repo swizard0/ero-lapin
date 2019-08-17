@@ -1,30 +1,11 @@
-use std::sync::{
-    Arc,
-    atomic::{
-        Ordering,
-        AtomicBool,
-    },
-};
-
 use futures::{
     Future,
-    future::{
-        lazy,
-        result,
-    },
+    future::result,
 };
 
-use tokio::net::TcpStream;
-
 use lapin_futures::{
-    client::{
-        self,
-        ConnectionOptions,
-    },
-    channel::{
-        Channel,
-        BasicQosOptions,
-    },
+    Client,
+    Channel,
 };
 
 use log::{
@@ -40,17 +21,27 @@ use ero::{
 
 #[derive(Debug)]
 pub struct AmqpParams {
+    pub host: String,
+    pub port: u16,
     pub user: String,
     pub pass: String,
     pub prefetch_count: u16,
+    pub frame_max: Option<u32>,
+    pub channel_max: Option<u16>,
+    pub heartbeat: Option<u16>,
 }
 
 impl Default for AmqpParams {
     fn default() -> AmqpParams {
         AmqpParams {
+            host: "localhost".to_string(),
+            port: lapin::uri::AMQPScheme::AMQP.default_port(),
             user: "guest".to_string(),
             pass: "guest".to_string(),
             prefetch_count: 32,
+            frame_max: Some(262144),
+            channel_max: None,
+            heartbeat: None,
         }
     }
 }
@@ -63,17 +54,14 @@ pub struct Params<N> {
 pub fn spawn_link<N>(
     supervisor: &Supervisor,
     params: Params<N>,
-    tcp_lode: LodeResource<TcpStream>,
 )
-    -> LodeResource<Channel<TcpStream>>
+    -> LodeResource<Channel>
 where N: AsRef<str> + Send + 'static,
 {
     let Params { amqp_params, lode_params, } = params;
 
     let init_state = InitState {
         amqp_params,
-        tcp_lode,
-        executor: supervisor.executor().clone(),
     };
 
     lode::shared::spawn_link(
@@ -89,14 +77,11 @@ where N: AsRef<str> + Send + 'static,
 
 struct InitState {
     amqp_params: AmqpParams,
-    tcp_lode: LodeResource<TcpStream>,
-    executor: tokio::runtime::TaskExecutor,
 }
 
 struct AmqpConnected {
     init_state: InitState,
-    client: client::Client<TcpStream>,
-    heartbeat_gone: Arc<AtomicBool>,
+    client: Client,
 }
 
 fn init(
@@ -104,54 +89,41 @@ fn init(
 )
     -> Box<dyn Future<Item = AmqpConnected, Error = ErrorSeverity<InitState, ()>> + Send + 'static>
 {
-    let InitState { amqp_params, tcp_lode, executor, } = init_state;
+    let InitState { amqp_params, } = init_state;
 
-    let future = tcp_lode
-        .steal_resource()
-        .map_err(|()| {
-            debug!("tcp_stream lode is gone, terminating");
-            ErrorSeverity::Fatal(())
-        })
-        .and_then(move |(tcp_stream, tcp_lode)| {
-            let options = ConnectionOptions {
+    let amqp_uri = lapin::uri::AMQPUri {
+        scheme: lapin::uri::AMQPScheme::AMQP,
+        authority: lapin::uri::AMQPAuthority {
+            userinfo: lapin::uri::AMQPUserInfo {
                 username: amqp_params.user.clone(),
                 password: amqp_params.pass.clone(),
-                frame_max: 262144,
-                ..Default::default()
-            };
-            debug!("tcp connection obtained, authorizing as {:?}", amqp_params);
-            client::Client::connect(tcp_stream, options)
-                .then(move |connect_result| {
-                    match connect_result {
-                        Ok((client, heartbeat_future)) => {
-                            let heartbeat_gone_lode = Arc::new(AtomicBool::new(false));
-                            let heartbeat_gone_task = heartbeat_gone_lode.clone();
-                            executor.spawn(
-                                heartbeat_future
-                                    .then(move |heartbeat_result| {
-                                        heartbeat_gone_task.store(true, Ordering::SeqCst);
-                                        match heartbeat_result {
-                                            Ok(()) =>
-                                                Ok(()),
-                                            Err(error) => {
-                                                error!("heartbeat task error: {:?}", error);
-                                                Err(())
-                                            },
-                                        }
-                                    })
-                            );
-                            Ok(AmqpConnected {
-                                init_state: InitState { amqp_params, tcp_lode, executor, },
-                                heartbeat_gone: heartbeat_gone_lode,
-                                client,
-                            })
-                        },
-                        Err(error) => {
-                            error!("amqp connection error: {:?}, retrying", error);
-                            Err(ErrorSeverity::Recoverable { state: InitState { amqp_params, tcp_lode, executor, }, })
-                        },
-                    }
-                })
+            },
+            host: amqp_params.host.clone(),
+            port: amqp_params.port,
+        },
+        vhost: "/".to_string(),
+        query: lapin::uri::AMQPQueryString {
+            frame_max: amqp_params.frame_max,
+            channel_max: amqp_params.channel_max,
+            heartbeat: amqp_params.heartbeat,
+        },
+    };
+    debug!("configured amqp as: {:?}", amqp_uri);
+
+    let future = Client::connect_uri(amqp_uri, Default::default())
+        .then(move |connect_result| {
+            match connect_result {
+                Ok(client) => {
+                    Ok(AmqpConnected {
+                        init_state: InitState { amqp_params, },
+                        client,
+                    })
+                },
+                Err(error) => {
+                    error!("amqp connection error: {:?}, retrying", error);
+                    Err(ErrorSeverity::Recoverable { state: InitState { amqp_params, }, })
+                },
+            }
         });
     Box::new(future)
 }
@@ -159,41 +131,32 @@ fn init(
 fn aquire(
     connected: AmqpConnected,
 )
-    -> Box<dyn Future<Item = (Channel<TcpStream>, AmqpConnected), Error = ErrorSeverity<InitState, ()>> + Send + 'static>
+    -> Box<dyn Future<Item = (Channel, AmqpConnected), Error = ErrorSeverity<InitState, ()>> + Send + 'static>
 {
-    let AmqpConnected { init_state, client, heartbeat_gone, } = connected;
-    let future = lazy(
-        move || if heartbeat_gone.load(Ordering::SeqCst) {
-            error!("heartbeat task is gone, restarting connection");
-            Err(ErrorSeverity::Recoverable { state: init_state, })
-        } else {
-            Ok((init_state, heartbeat_gone))
-        })
-        .and_then(move |(init_state, heartbeat_gone)| {
-            client.create_channel()
-                .then(move |create_result| {
-                    match create_result {
-                        Ok(channel) => {
-                            debug!("channel id = {} created", channel.id);
-                            Ok((channel, AmqpConnected { init_state, client, heartbeat_gone, }))
-                        },
-                        Err(error) => {
-                            error!("create_channel error: {:?}, restarting connection", error);
-                            Err(ErrorSeverity::Recoverable { state: init_state, })
-                        },
-                    }
-                })
+    let AmqpConnected { init_state, client, } = connected;
+    let future = client.create_channel()
+        .then(move |create_result| {
+            match create_result {
+                Ok(channel) => {
+                    debug!("channel id = {} created", channel.id());
+                    Ok((channel, AmqpConnected { init_state, client, }))
+                },
+                Err(error) => {
+                    error!("create_channel error: {:?}, restarting connection", error);
+                    Err(ErrorSeverity::Recoverable { state: init_state, })
+                },
+            }
         })
         .and_then(|(channel, connected)| {
             channel
-                .basic_qos(BasicQosOptions {
-                    prefetch_count: connected.init_state.amqp_params.prefetch_count,
-                    ..Default::default()
-                })
+                .basic_qos(
+                    connected.init_state.amqp_params.prefetch_count,
+                    Default::default(),
+                )
                 .then(|qos_result| {
                     match qos_result {
                         Ok(()) => {
-                            debug!("qos set for channel id = {}", channel.id);
+                            debug!("qos set for channel id = {}", channel.id());
                             Ok((channel, connected))
                         },
                         Err(error) => {
@@ -208,16 +171,11 @@ fn aquire(
 
 fn release(
     connected: AmqpConnected,
-    _maybe_session: Option<Channel<TcpStream>>,
+    _maybe_session: Option<Channel>,
 )
     -> impl Future<Item = AmqpConnected, Error = ErrorSeverity<InitState, ()>>
 {
-    lazy(move || if connected.heartbeat_gone.load(Ordering::SeqCst) {
-        error!("heartbeat task is gone, restarting connection");
-        Err(ErrorSeverity::Recoverable { state: connected.init_state, })
-    } else {
-        Ok(connected)
-    })
+    result(Ok(connected))
 }
 
 fn close(
